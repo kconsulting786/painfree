@@ -28,13 +28,19 @@ param(
     # Do not open the report in a browser when finished.
     [switch]$NoOpen,
     # Skip the slower checks (program log scan, folder sizes, dcdiag).
-    [switch]$Quick
+    [switch]$Quick,
+    # Upload the report to a PRIVATE GitHub repository for later analysis.
+    [switch]$Upload,
+    # owner/repo to upload to. Must be private.
+    [string]$UploadRepo = 'kconsulting786/painfree-results',
+    # Fine-grained GitHub token with Contents read/write on UploadRepo only. Prompted for when not given.
+    [string]$UploadToken
 )
 
 $PainfreeVersion = '0.1.0'
 
 function Start-Painfree {
-    param([int]$Days, [string]$OutputPath, [switch]$NoOpen, [switch]$Quick)
+    param([int]$Days, [string]$OutputPath, [switch]$NoOpen, [switch]$Quick, [switch]$Upload, [string]$UploadRepo, [string]$UploadToken)
 
     $ErrorActionPreference = 'SilentlyContinue'
     $ProgressPreference = 'SilentlyContinue'
@@ -1671,9 +1677,38 @@ render();
     Write-Host "  Report: $OutputPath" -ForegroundColor Green
     Write-Host "  Data:   $jsonPath" -ForegroundColor DarkGray
     Write-Host ''
+    if ($Upload) {
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+            if (-not $UploadToken) {
+                $sec = Read-Host "  GitHub token for $UploadRepo (input hidden)" -AsSecureString
+                $UploadToken = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec))
+            }
+            $headers = @{ Authorization = "Bearer $UploadToken"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28'; 'User-Agent' = "Painfree/$PainfreeVersion" }
+            $repoInfo = Invoke-RestMethod -Uri "https://api.github.com/repos/$UploadRepo" -Headers $headers -ErrorAction Stop
+            if (-not $repoInfo.private) { throw "$UploadRepo is public. Scan results contain sensitive details, so Painfree only uploads to a private repository." }
+            $folder = 'results/{0}/{1:yyyy-MM-dd_HHmm}' -f ($env:COMPUTERNAME -replace '[^A-Za-z0-9_-]', '_'), (Get-Date)
+            foreach ($f in @(@{ Local = $jsonPath; Name = 'report.json' }, @{ Local = $OutputPath; Name = 'report.html' })) {
+                $body = @{
+                    message = "Painfree scan of $env:COMPUTERNAME ($score/100)"
+                    content = [Convert]::ToBase64String([IO.File]::ReadAllBytes($f.Local))
+                } | ConvertTo-Json
+                Invoke-RestMethod -Method Put -Uri "https://api.github.com/repos/$UploadRepo/contents/$folder/$($f.Name)" -Headers $headers -Body $body -ContentType 'application/json' -ErrorAction Stop | Out-Null
+            }
+            Write-Host "  Uploaded: https://github.com/$UploadRepo/tree/$($repoInfo.default_branch)/$folder" -ForegroundColor Green
+        }
+        catch {
+            $msg = $_.Exception.Message
+            if ($_.ErrorDetails.Message) { $msg += " - $($_.ErrorDetails.Message)" }
+            Write-Host "  Upload failed: $msg" -ForegroundColor Red
+            Write-Host '  The report is still saved locally (see above).' -ForegroundColor DarkGray
+        }
+        finally { $UploadToken = $null }
+        Write-Host ''
+    }
     if (-not $NoOpen) { try { Start-Process $OutputPath } catch { Write-Host '  (Could not open a browser. Copy the report to a PC to view it.)' -ForegroundColor DarkGray } }
 
     #endregion
 }
 
-Start-Painfree -Days $Days -OutputPath $OutputPath -NoOpen:$NoOpen -Quick:$Quick
+Start-Painfree -Days $Days -OutputPath $OutputPath -NoOpen:$NoOpen -Quick:$Quick -Upload:$Upload -UploadRepo $UploadRepo -UploadToken $UploadToken
