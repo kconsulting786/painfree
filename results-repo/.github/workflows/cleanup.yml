@@ -1,0 +1,37 @@
+# Deletes Painfree scan results older than RETENTION_DAYS and squashes history,
+# so old scans are not kept in git history either.
+name: Clean up old scan results
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+env:
+  RETENTION_DAYS: 3
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Remove expired results
+        run: |
+          cutoff=$(date -u -d "-${RETENTION_DAYS} days" +%Y-%m-%d)
+          shopt -s nullglob
+          for dir in results/*/*/; do
+            stamp=$(basename "$dir" | cut -c1-10)
+            if [[ "$stamp" < "$cutoff" ]]; then
+              echo "Removing $dir"
+              rm -rf "$dir"
+            fi
+          done
+          find results -type d -empty -delete 2>/dev/null || true
+      - name: Squash history so removed scans are gone
+        run: |
+          git config user.name "painfree-cleanup"
+          git config user.email "painfree-cleanup@users.noreply.github.com"
+          branch="${GITHUB_REF_NAME}"
+          git checkout --orphan squashed
+          git add -A
+          git commit -m "Painfree results (last ${RETENTION_DAYS} days) as of $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push --force origin "squashed:${branch}"

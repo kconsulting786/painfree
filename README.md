@@ -26,6 +26,29 @@ To pass options, use this form:
 | `-OutputPath <path>` | File or folder to write the report to (default: Desktop). |
 | `-NoOpen` | Don't open the report when done (handy on Server Core). |
 | `-Quick` | Skip the slower checks: program log scan, folder sizes and dcdiag. |
+| `-Upload` | Also upload the report to a private GitHub repo for later analysis (see below). |
+| `-UploadRepo <owner/repo>` | Repo to upload to (default `kconsulting786/painfree-results`). Must be private. |
+| `-UploadToken <token>` | GitHub token for the upload. If left out, Painfree uses `$env:PAINFREE_TOKEN`, then a token saved on the machine, and otherwise asks for it with hidden input. |
+| `-SaveToken` | Use with `-Upload`: saves the token on this machine, encrypted, so later `-Upload` runs don't ask for it. |
+| `-ClearToken` | Deletes the saved token from this machine and exits. |
+
+## Uploading results for analysis
+
+Painfree can push each report to a **private** GitHub repo so the results can be reviewed in depth later. It refuses to upload to a public repo.
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/kconsulting786/painfree/main/painfree.ps1))) -Upload
+```
+
+To stop being asked for the token on a machine, run once with `-Upload -SaveToken`. The token is encrypted with Windows DPAPI (machine scope, so scheduled tasks running as SYSTEM can use it) and stored in `C:\ProgramData\Painfree\upload-token.bin`, in a folder only Administrators and SYSTEM can read. After that, plain `-Upload` uses it. For RMM tools, set the `PAINFREE_TOKEN` environment variable instead. The token is never stored in the script: the script is public, so a token embedded in it, even an encrypted one, could be used by anyone.
+
+Each scan is saved to `results/<COMPUTER>/<yyyy-MM-dd_HHmm>/report.json` and `report.html` in the results repo. Unless you use `-SaveToken`, the token is only used for that run and is never written to disk.
+
+One-time setup:
+
+1. Create a private repo, for example `painfree-results`.
+2. Copy the contents of [`results-repo/`](results-repo/) into it. This includes a daily GitHub Action that deletes scans older than 3 days and squashes the history, so old scans don't stay in git either.
+3. Create a [fine-grained personal access token](https://github.com/settings/personal-access-tokens/new) that has access to **only** that repository, with **Contents: Read and write** permission, and a short expiry.
 
 ## Supported systems
 
