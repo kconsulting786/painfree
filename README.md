@@ -58,18 +58,19 @@ Windows 10, Windows 11, and Windows Server 2016, 2019, 2022 and 2025, using the 
 
 | Area | Checks |
 |---|---|
-| Updates | Windows version end of support, last update installed, failed updates, Windows Update disabled or blocked by policy, pending reboot |
+| Updates | Windows version end of support, RMM-managed patching recognised (Datto, NinjaOne, ConnectWise, N-able, Kaseya, Atera, Intune), last update installed, failed updates, Windows Update disabled or blocked by policy, pending reboot |
 | Event logs | System, Application, Defender and role logs: about 70 known problem events with specific fixes (unexpected shutdowns, blue screens, disk and controller errors, NTFS corruption, service failures, DNS and domain problems, hardware WHEA errors, VSS, Group Policy, Secure Boot certificates, and more), plus any other recurring errors and repeated application crashes |
 | Security log | Failed logon floods, grouped by account and source address |
+| Power | Unexpected restarts while the UPS agent (APC PowerChute) can't reach the UPS; servers with power losses and no UPS shutdown software |
 | Disks | Low free space, unhealthy disks, SMART failure prediction, SSD wear, uncorrected errors, temperature, volumes marked dirty, things that are safe to clean up |
 | Performance | Memory and CPU pressure, page file, low RAM, server power plan, too many startup programs |
 | Hardware | Devices with driver problems, crash dumps, Windows Error Reporting crash reports |
 | Services and tasks | Automatic services that are stopped, services and scheduled tasks pointing to missing programs, failed scheduled tasks, unquoted service paths |
 | Registry | Broken startup entries, Winlogon Shell/Userinit hijacks, IFEO debugger hijacks, AppInit_DLLs, policies that disable admin tools, dead PATH entries, orphaned uninstall entries, hosts file entries |
 | Security settings | Antivirus and Defender state, more than one antivirus, firewall, UAC, SMBv1, SMB signing on DCs, RDP without NLA, WDigest, LM/NTLMv1, old TLS, Guest account, local admins, BitLocker, Secure Boot and the 2023 certificate update, PowerShell 2.0, broad share permissions, expiring certificates |
-| Network | Domain machines using public DNS, APIPA addresses, internet name resolution, broken domain trust, time sync, WinHTTP proxy, NIC errors |
+| Network | Third-party time tools alongside Windows Time, domain machines using public DNS, APIPA addresses, internet name resolution, broken domain trust, time sync, WinHTTP proxy, NIC errors |
 | Programs | End-of-life software (Flash, old Office, Java, QuickTime and so on), adware and "optimisers", OEM bloatware, vulnerable 7-Zip/WinRAR versions, duplicate versions, built-in Store apps people usually remove, consumer apps on servers, remote access tools on servers |
-| Program logs | Recent `.log` files under ProgramData and Program Files with many error lines, and corruption logged in CBS.log |
+| Program logs | Error-level lines in recent logs under ProgramData and Program Files, grouped per application (warnings and telemetry noise ignored); DNS/connection failures reported by several applications grouped into one network finding; corruption logged in CBS.log |
 
 ### Server roles (checked automatically when found)
 
@@ -80,7 +81,7 @@ Windows 10, Windows 11, and Windows Server 2016, 2019, 2022 and 2025, using the 
 | Active Directory | Replication failures (repadmin), dcdiag failures, SYSVOL still on FRS, PDC time source, AD Recycle Bin, Print Spooler running on DCs |
 | DNS Server | Forwarders that don't respond, scavenging |
 | DHCP Server | Scopes nearly full, inactive scopes |
-| Hyper-V | Unhealthy VMs, old checkpoints, Replica health, VMs that are hard powered off when the host shuts down |
+| Hyper-V | Unhealthy VMs, old checkpoints, Replica health, VMs that are hard powered off when the host shuts down, VMQ enabled on 1 GbE switch adapters; memory judged after subtracting RAM assigned to VMs |
 | Exchange | End of support, backed-up mail queues |
 
 ## Notes
