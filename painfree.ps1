@@ -178,6 +178,8 @@ function Start-Painfree {
             $p = $Matches[3]
         }
         if ($p -notmatch '^(?i)[a-z]:\\') { return $null }
+        # Windows runs "C:\path\app" as app.exe when no extension is given
+        if (-not [IO.Path]::GetExtension($p) -and -not (Test-Path -LiteralPath $p) -and (Test-Path -LiteralPath "$p.exe")) { $p = "$p.exe" }
         return $p
     }
 
@@ -343,6 +345,20 @@ function Start-Painfree {
             $PF.Info['Last update installed'] = $last.ToString('yyyy-MM-dd')
             $age = ((Get-Date) - $last).Days
             if ($age -gt 60) { $sev = 'High' } elseif ($age -gt 35) { $sev = 'Medium' } else { $sev = $null }
+            # Most recent Patch Tuesday (second Tuesday) that is at least 7 days old
+            $pt = $null
+            foreach ($m in 0, 1, 2) {
+                $first = (Get-Date -Day 1).Date.AddMonths(-$m)
+                $tue = $first.AddDays((9 - [int]$first.DayOfWeek) % 7).AddDays(7)
+                if ($tue.AddDays(7) -le (Get-Date)) { $pt = $tue; break }
+            }
+            if (-not $sev -and $pt -and $last -lt $pt) {
+                Add-Finding -Category 'Updates' -Severity 'Medium' -Title "The $($pt.ToString('MMMM yyyy')) security update is not installed" `
+                    -Description "Microsoft released the monthly security update on $($pt.ToString('yyyy-MM-dd')). The last update on this machine was installed before that, so it is a month behind." `
+                    -Evidence "Last successful update: $($last.ToString('yyyy-MM-dd'))   Patch Tuesday: $($pt.ToString('yyyy-MM-dd'))" `
+                    -Fix "Install the latest cumulative update and reboot. If an RMM or WSUS manages patching, check why this device was skipped or failed (device not in the patch policy, failed job, pending reboot blocking installs)." `
+                    -Command 'UsoClient StartInteractiveScan'
+            }
             if ($sev) {
                 Add-Finding -Category 'Updates' -Severity $sev -Title "No Windows updates installed for $age days" `
                     -Description 'Microsoft releases security updates monthly (second Tuesday). A machine more than a month behind is missing security fixes.' `
@@ -456,6 +472,8 @@ function Start-Painfree {
         @{L = 'System'; P = 'User Profile'; I = 1511; S = 'High'; T = 'User logged on with a temporary profile'; F = 'The profile could not be loaded. Check HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList for a .bak duplicate SID key and fix the ProfileImagePath/State values.' }
         @{L = 'Application'; P = 'User Profile'; I = 1511; S = 'High'; T = 'User logged on with a temporary profile'; F = 'Check HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList for a duplicate .bak key and fix it.' }
         @{L = 'Application'; P = 'User Profile'; I = 1530; S = 'Info'; T = 'Registry handles left open at logoff (1530)'; F = 'Normal behaviour; Windows cleans these up. Ignore unless profiles fail to unload.' }
+        @{L = 'Application'; P = 'VSS'; I = 8194; S = 'Medium'; T = 'VSS writers cannot call back to the backup software (VSS 8194, access denied)'; F = "The backup software calls VSS, but the default COM access permissions do not let the writers (running as NETWORK SERVICE) answer. Fix: run dcomcnfg > Component Services > Computers > My Computer > Properties > COM Security > Access Permissions > Edit Default, add NETWORK SERVICE with Local Access allowed. Then run a backup and check 'vssadmin list writers'."; C = 'vssadmin list writers' }
+        @{L = 'Application'; P = 'Perflib'; I = 1023; S = 'Low'; T = 'Performance counter DLL cannot be loaded (Perflib 1023)'; F = 'Usually left over from uninstalled software (often old antivirus). Remove the Performance subkey of the service named in the event, then rebuild the counters with lodctr /R from an elevated prompt in C:\Windows\System32.'; C = 'lodctr /R' }
         @{L = 'Application'; P = 'VSS'; I = 8193; S = 'Medium'; T = 'Volume Shadow Copy error (VSS 8193)'; F = 'Backups and restore points may fail. Run vssadmin list writers to find failed writers and restart the related service.'; C = 'vssadmin list writers' }
         @{L = 'Application'; P = 'VSS'; I = 12289; S = 'Medium'; T = 'Volume Shadow Copy error (VSS 12289)'; F = 'Check vssadmin list writers and vssadmin list providers. Third-party VSS providers from old backup software are a common cause.'; C = 'vssadmin list writers' }
         @{L = 'Application'; P = 'VSS'; I = 13; S = 'Medium'; T = 'Volume Shadow Copy error (VSS 13)'; F = 'Check COM+ and the VSS service; run vssadmin list writers.'; C = 'vssadmin list writers' }
@@ -491,7 +509,15 @@ function Start-Painfree {
 
     Invoke-Check 'Event logs (errors and known issues)' {
         foreach ($log in $logs) {
-            $events = @(Get-WinEvent -FilterHashtable @{ LogName = $log; Level = 1, 2, 3; StartTime = $PF.Start } -MaxEvents 20000 -ErrorAction SilentlyContinue)
+          # Each log is handled on its own so that a missing or unreadable log cannot stop the others
+          try {
+            if (-not (Get-WinEvent -ListLog $log -ErrorAction SilentlyContinue)) { continue }
+            try { $events = @(Get-WinEvent -FilterHashtable @{ LogName = $log; Level = 1, 2, 3; StartTime = $PF.Start } -MaxEvents 20000 -ErrorAction Stop) }
+            catch {
+                if ($_.Exception.Message -match 'No events were found') { continue }
+                # Some logs reject the combined filter; fall back to reading recent entries and filtering here
+                $events = @(Get-WinEvent -LogName $log -MaxEvents 20000 -ErrorAction Stop | Where-Object { $_.Level -in 1, 2, 3 -and $_.TimeCreated -ge $PF.Start })
+            }
             if (-not $events.Count) { continue }
             $groups = @{}
             $crashes = @{}
@@ -547,6 +573,8 @@ function Start-Painfree {
                     -Evidence @("Program: $($c.App)", "Faulting module: $($c.Module)", "Last: $($c.Last.ToString('yyyy-MM-dd HH:mm'))") `
                     -Fix "Update the program to the latest version or repair/reinstall it. If the faulting module is a third-party DLL (shell extensions, AV, overlays), update or remove that software. If the module is ntdll.dll or KERNELBASE.dll the fault is in the program itself."
             }
+          }
+          catch { $PF.Errors.Add([pscustomobject]@{ Check = "Event log '$log'"; Error = ($_.Exception.Message -split "`r?`n")[0] }) }
         }
     }
 
@@ -741,7 +769,7 @@ function Start-Painfree {
 
     Invoke-Check 'Automatic services not running' {
         # Services that are set to Automatic but stop by design
-        $ignore = 'gupdate|gupdatem|edgeupdate|edgeupdatem|MicrosoftEdgeElevationService|GoogleUpdater|sppsvc|RemoteRegistry|MapsBroker|tiledatamodelsvc|CDPSvc|ShellHWDetection|WbioSrvc|TrustedInstaller|stisvc|BITS|wuauserv|UsoSvc|DoSvc|WaaSMedicSvc|clr_optimization|NetTcpPortSharing|sedsvc|AGMService|AGSService|OneSyncSvc|CDPUserSvc|WpnUserService|Intel\(R\) TPM|SysMain|Dnscache|IaasVmProvider|DPS|WinDefend|MsMpSvc|Sense|wscsvc|gpsvc|tzautoupdate|CertPropSvc|AdobeARMservice|ClickToRunSvc|VSStandardCollectorService|ssh-agent|osrss|SgrmBroker|WSearch|cbdhsvc|camsvc|InventorySvc|DcpSvc'
+        $ignore = 'gupdate|gupdatem|edgeupdate|edgeupdatem|MicrosoftEdgeElevationService|GoogleUpdater|sppsvc|RemoteRegistry|MapsBroker|tiledatamodelsvc|CDPSvc|ShellHWDetection|WbioSrvc|TrustedInstaller|stisvc|BITS|wuauserv|UsoSvc|DoSvc|WaaSMedicSvc|clr_optimization|NetTcpPortSharing|sedsvc|AGMService|AGSService|OneSyncSvc|CDPUserSvc|WpnUserService|Intel\(R\) TPM|SysMain|Dnscache|IaasVmProvider|DPS|WinDefend|MsMpSvc|Sense|wscsvc|gpsvc|tzautoupdate|CertPropSvc|AdobeARMservice|ClickToRunSvc|VSStandardCollectorService|ssh-agent|osrss|SgrmBroker|WSearch|cbdhsvc|camsvc|InventorySvc|DcpSvc|uvnc_service'
         $stopped = @($services | Where-Object {
                 $_.StartMode -eq 'Auto' -and $_.State -ne 'Running' -and $_.Name -notmatch "^($ignore)" -and -not $_.DelayedAutoStart -and
                 -not (Test-Path "HKLM:\SYSTEM\CurrentControlSet\Services\$($_.Name)\TriggerInfo")
@@ -788,7 +816,7 @@ function Start-Painfree {
     }
 
     Invoke-Check 'Scheduled tasks' {
-        $okCodes = 0, 267008, 267009, 267011, 267012, 267014, 267045, 1, 2147750687
+        $okCodes = 0, 1056, 267008, 267009, 267011, 267012, 267014, 267045, 1, 2147750687
         $tasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.State -ne 'Disabled' -and $_.TaskPath -notlike '\Microsoft\*' })
         $failed = @(); $broken = @()
         foreach ($t in $tasks) {
@@ -929,10 +957,14 @@ function Start-Painfree {
                     -Evidence ($thirdParty | ForEach-Object { $_.displayName }) -Fix 'Keep one antivirus and uninstall the others with their vendor removal tool.'
             }
         }
-        else {
-            $avSvc = 'SentinelAgent|CSFalconService|SAVService|Sophos|ekrn|McAfee|mfemms|Symantec|SepMasterService|bdservicehost|EPSecurityService|WRSVC|CylanceSvc|TmCCSF|ds_agent|CarbonBlack|cbdefense|HuntressAgent|AvastSvc|AVP|klnagent'
-            $thirdParty = @($services | Where-Object { $_.Name -match "^($avSvc)" -and $_.State -eq 'Running' })
+        if (-not $thirdParty.Count) {
+            # Servers have no Security Center, and some business AV does not register with it either
+            $avSvc = 'SentinelAgent|CSFalconService|SAVService|Sophos|ekrn|McAfee|mfemms|Symantec|SepMasterService|bdservicehost|EPSecurityService|WRSVC|CylanceSvc|TmCCSF|ds_agent|CarbonBlack|cbdefense|AvastSvc|AVP|klnagent'
+            $avName = 'Datto AV|Trend Micro|Webroot|Bitdefender|ESET|Sophos|SentinelOne|CrowdStrike|Malwarebytes|Cylance|Carbon Black|Symantec|McAfee|Trellix|Kaspersky|WithSecure|F-Secure|Avast|AVG|VIPRE|Emsisoft|Cisco Secure Endpoint|Panda|Cortex XDR|Elastic Agent'
+            $thirdParty = @($services | Where-Object { $_.State -eq 'Running' -and ($_.Name -match "^($avSvc)" -or $_.DisplayName -match "($avName)") } |
+                    ForEach-Object { [pscustomobject]@{ displayName = $_.DisplayName } })
         }
+        $edrOnly = @($services | Where-Object { $_.State -eq 'Running' -and $_.DisplayName -match 'Datto EDR|Infocyte|HUNT Agent|Huntress|Blackpoint|SnapAgent' } | ForEach-Object DisplayName)
         $mp = if (Get-Command Get-MpComputerStatus -ErrorAction SilentlyContinue) { Get-MpComputerStatus -ErrorAction SilentlyContinue } else { $null }
         if ($mp) {
             $passive = "$($mp.AMRunningMode)" -match 'Passive|EDR'
@@ -954,6 +986,11 @@ function Start-Painfree {
             $PF.Info['Antivirus'] = if ($thirdParty.Count) { ($thirdParty | ForEach-Object { if ($_.displayName) { $_.displayName } else { $_.DisplayName } }) -join ', ' } else { "Microsoft Defender ($($mp.AMRunningMode))" }
         }
         elseif ($thirdParty.Count) { $PF.Info['Antivirus'] = ($thirdParty | ForEach-Object { if ($_.displayName) { $_.displayName } else { $_.DisplayName } }) -join ', ' }
+        elseif ($edrOnly.Count) {
+            Add-Finding -Category 'Security' -Severity 'High' -Title "Only EDR found ($($edrOnly -join ', ')), no antivirus" -Description 'An EDR agent is running, but no antivirus was found: Microsoft Defender is missing or removed and no other AV service is running. Most EDR products expect an AV underneath them.' `
+                -Evidence (@($edrOnly) + 'Microsoft Defender: not present') -Fix 'Confirm in your RMM/EDR console whether an AV (for example Datto AV or Defender) should be on this machine. If not, reinstall Defender.' `
+                -Command $(if ($isServer) { 'Install-WindowsFeature Windows-Defender   # reboot required' } else { 'Get-Service WinDefend' })
+        }
         else {
             Add-Finding -Category 'Security' -Severity 'High' -Title 'No antivirus detected' -Description 'Neither Microsoft Defender nor a known third-party antivirus was found running.' `
                 -Fix 'Install Microsoft Defender (Server: Install-WindowsFeature Windows-Defender) or your organisation''s antivirus.'
