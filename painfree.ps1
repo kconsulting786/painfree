@@ -42,7 +42,7 @@ param(
     [switch]$ClearToken
 )
 
-$PainfreeVersion = '0.1.0'
+$PainfreeVersion = '0.2.0'
 
 function Start-Painfree {
     param([int]$Days, [string]$OutputPath, [switch]$NoOpen, [switch]$Quick, [switch]$Upload, [string]$UploadRepo, [string]$UploadToken, [switch]$SaveToken, [switch]$ClearToken)
@@ -58,6 +58,7 @@ function Start-Painfree {
         Checks   = New-Object System.Collections.Generic.List[object]
         Roles    = New-Object System.Collections.Generic.List[string]
         Info     = [ordered]@{}
+        Events   = @{}
         Start    = (Get-Date).AddDays(-$Days)
     }
 
@@ -177,6 +178,8 @@ function Start-Painfree {
             $p = $Matches[3]
         }
         if ($p -notmatch '^(?i)[a-z]:\\') { return $null }
+        # Windows runs "C:\path\app" as app.exe when no extension is given
+        if (-not [IO.Path]::GetExtension($p) -and -not (Test-Path -LiteralPath $p) -and (Test-Path -LiteralPath "$p.exe")) { $p = "$p.exe" }
         return $p
     }
 
@@ -254,6 +257,10 @@ function Start-Painfree {
     }
     foreach ($r in $roleMap.Keys) { if (& $roleMap[$r]) { $PF.Roles.Add($r) } }
     $PF.Info['Detected roles'] = if ($PF.Roles.Count) { $PF.Roles -join ', ' } else { 'None' }
+    # RMM agents usually own patching (they set NoAutoUpdate) and remote access
+    $rmmMap = [ordered]@{ 'Datto RMM' = '^CagService$'; 'NinjaOne' = '^NinjaRMMAgent$'; 'ConnectWise Automate' = '^LTService$'; 'N-able N-sight' = '^Advanced Monitoring Agent$'; 'N-able N-central' = '^Windows Agent Service$'; 'Kaseya VSA' = '^Kaseya Agent'; 'Atera' = '^AteraAgent$'; 'SyncroMSP' = '^Syncro$'; 'Action1' = '^A1Agent$'; 'Intune' = '^IntuneManagementExtension$' }
+    $rmm = @(foreach ($k in $rmmMap.Keys) { if (@($services | Where-Object { $_.Name -match $rmmMap[$k] -or $_.DisplayName -match $rmmMap[$k] }).Count) { $k } })
+    if ($rmm.Count) { $PF.Info['Management agents'] = $rmm -join ', ' }
 
     Write-Host "  $($PF.Info['Operating system'])" -ForegroundColor Gray
     Write-Host "  Roles: $($PF.Info['Detected roles'])" -ForegroundColor Gray
@@ -338,6 +345,20 @@ function Start-Painfree {
             $PF.Info['Last update installed'] = $last.ToString('yyyy-MM-dd')
             $age = ((Get-Date) - $last).Days
             if ($age -gt 60) { $sev = 'High' } elseif ($age -gt 35) { $sev = 'Medium' } else { $sev = $null }
+            # Most recent Patch Tuesday (second Tuesday) that is at least 7 days old
+            $pt = $null
+            foreach ($m in 0, 1, 2) {
+                $first = (Get-Date -Day 1).Date.AddMonths(-$m)
+                $tue = $first.AddDays((9 - [int]$first.DayOfWeek) % 7).AddDays(7)
+                if ($tue.AddDays(7) -le (Get-Date)) { $pt = $tue; break }
+            }
+            if (-not $sev -and $pt -and $last -lt $pt) {
+                Add-Finding -Category 'Updates' -Severity 'Medium' -Title "The $($pt.ToString('MMMM yyyy')) security update is not installed" `
+                    -Description "Microsoft released the monthly security update on $($pt.ToString('yyyy-MM-dd')). The last update on this machine was installed before that, so it is a month behind." `
+                    -Evidence "Last successful update: $($last.ToString('yyyy-MM-dd'))   Patch Tuesday: $($pt.ToString('yyyy-MM-dd'))" `
+                    -Fix "Install the latest cumulative update and reboot. If an RMM or WSUS manages patching, check why this device was skipped or failed (device not in the patch policy, failed job, pending reboot blocking installs)." `
+                    -Command 'UsoClient StartInteractiveScan'
+            }
             if ($sev) {
                 Add-Finding -Category 'Updates' -Severity $sev -Title "No Windows updates installed for $age days" `
                     -Description 'Microsoft releases security updates monthly (second Tuesday). A machine more than a month behind is missing security fixes.' `
@@ -355,7 +376,12 @@ function Start-Painfree {
                 -Command 'Set-Service -Name wuauserv -StartupType Manual'
         }
         $au = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
-        if ((Get-RegValue $au 'NoAutoUpdate') -eq 1) {
+        if ((Get-RegValue $au 'NoAutoUpdate') -eq 1 -and $rmm.Count) {
+            Add-Finding -Category 'Updates' -Severity 'Info' -Title "Automatic updates are off; patching is likely managed by $($rmm -join ', ')" `
+                -Description 'RMM tools set NoAutoUpdate so that they control when patches install and when the machine reboots. This is normal, as long as the RMM patch policy covers this machine.' `
+                -Evidence "$au\NoAutoUpdate = 1" -Fix 'Confirm the RMM patch policy includes this device and that its patch status is green. See the "No Windows updates installed" finding if updates are behind.'
+        }
+        elseif ((Get-RegValue $au 'NoAutoUpdate') -eq 1) {
             Add-Finding -Category 'Updates' -Severity 'Medium' -Title 'Automatic updates are turned off by policy' `
                 -Description 'The NoAutoUpdate policy is set, so updates only install when someone runs them manually.' `
                 -Evidence "$au\NoAutoUpdate = 1" `
@@ -446,12 +472,18 @@ function Start-Painfree {
         @{L = 'System'; P = 'User Profile'; I = 1511; S = 'High'; T = 'User logged on with a temporary profile'; F = 'The profile could not be loaded. Check HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList for a .bak duplicate SID key and fix the ProfileImagePath/State values.' }
         @{L = 'Application'; P = 'User Profile'; I = 1511; S = 'High'; T = 'User logged on with a temporary profile'; F = 'Check HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList for a duplicate .bak key and fix it.' }
         @{L = 'Application'; P = 'User Profile'; I = 1530; S = 'Info'; T = 'Registry handles left open at logoff (1530)'; F = 'Normal behaviour; Windows cleans these up. Ignore unless profiles fail to unload.' }
+        @{L = 'Application'; P = 'VSS'; I = 8194; S = 'Medium'; T = 'VSS writers cannot call back to the backup software (VSS 8194, access denied)'; F = "The backup software calls VSS, but the default COM access permissions do not let the writers (running as NETWORK SERVICE) answer. Fix: run dcomcnfg > Component Services > Computers > My Computer > Properties > COM Security > Access Permissions > Edit Default, add NETWORK SERVICE with Local Access allowed. Then run a backup and check 'vssadmin list writers'."; C = 'vssadmin list writers' }
+        @{L = 'Application'; P = 'Perflib'; I = 1023; S = 'Low'; T = 'Performance counter DLL cannot be loaded (Perflib 1023)'; F = 'Usually left over from uninstalled software (often old antivirus). Remove the Performance subkey of the service named in the event, then rebuild the counters with lodctr /R from an elevated prompt in C:\Windows\System32.'; C = 'lodctr /R' }
         @{L = 'Application'; P = 'VSS'; I = 8193; S = 'Medium'; T = 'Volume Shadow Copy error (VSS 8193)'; F = 'Backups and restore points may fail. Run vssadmin list writers to find failed writers and restart the related service.'; C = 'vssadmin list writers' }
         @{L = 'Application'; P = 'VSS'; I = 12289; S = 'Medium'; T = 'Volume Shadow Copy error (VSS 12289)'; F = 'Check vssadmin list writers and vssadmin list providers. Third-party VSS providers from old backup software are a common cause.'; C = 'vssadmin list writers' }
         @{L = 'Application'; P = 'VSS'; I = 13; S = 'Medium'; T = 'Volume Shadow Copy error (VSS 13)'; F = 'Check COM+ and the VSS service; run vssadmin list writers.'; C = 'vssadmin list writers' }
         @{L = 'Application'; P = 'MsiInstaller'; I = 11708; S = 'Low'; T = 'Software installation failed (MsiInstaller 11708)'; F = 'Retry the installation with logging (msiexec /i package.msi /l*v log.txt) and check the log.' }
         @{L = 'Application'; P = 'MSExchangeTransport'; I = 15004; S = 'High'; T = 'Exchange back pressure: resources low (15004)'; F = 'Exchange stopped accepting mail because disk space or memory is low on the transport server. Free disk space on the queue database drive.' }
         @{L = 'Application'; P = 'MSExchangeTransport'; I = 15006; S = 'High'; T = 'Exchange back pressure: disk space critical (15006)'; F = 'Free disk space on the transport queue drive immediately; mail flow is stopped.' }
+        @{L = 'Application'; P = 'APCPBEAgent|PowerChute'; I = 3005; S = 'High'; T = 'UPS is not communicating with PowerChute (APC 3005)'; F = "PowerChute cannot talk to the UPS, so the server will NOT be shut down cleanly when the power fails. Check the APC USB/serial cable (generic cables do not work), confirm an 'American Power Conversion' HID UPS device shows in Device Manager, re-run the PowerChute connection wizard, and run a UPS self-test." }
+        @{L = 'Application'; P = 'APCPBEAgent|PowerChute'; I = 174; S = 'High'; T = 'UPS switched to battery (APC 174)'; F = 'Mains power was lost. Check the site power and the UPS runtime; plan for a generator or longer runtime if outages are frequent.' }
+        @{L = 'System'; P = 'Hyper-V-VmSwitch'; I = 260; S = 'Medium'; T = 'Hyper-V switch VMQ/RSS errors (VmSwitch 260)'; F = "The virtual switch could not move RSS queues between VMQs. This often causes dropped or stalled VM and host traffic. Update the physical NIC driver and firmware from the server vendor. If it persists on a 1 GbE adapter, disable VMQ on that adapter (Disable-NetAdapterVmq)." }
+        @{L = 'System'; P = 'Hyper-V-VmSwitch'; I = 76; S = 'Low'; T = 'Hyper-V switch NIC operations failing (VmSwitch 76)'; F = 'Usually logged while a VM network adapter is being removed or a VM is stopping. Investigate only together with VmSwitch 260 or network drops; update NIC drivers.' }
         @{L = 'Application'; P = 'ESENT'; I = 455; S = 'Low'; T = 'ESENT database log file error (455)'; F = 'Often a missing folder for an app database (e.g. TileDataLayer). Usually harmless; recreate the folder named in the event if an app is failing.' }
         @{L = 'Security'; P = 'Eventlog'; I = 1102; S = 'Medium'; T = 'The Security log was cleared'; F = 'Confirm who cleared the Security log. Unexpected clearing can indicate an attacker covering tracks.' }
         @{L = 'Directory Service'; P = 'NTDS Replication'; I = 2042; S = 'Critical'; T = 'AD replication stopped longer than tombstone lifetime (2042)'; F = 'This DC has not replicated for longer than the tombstone lifetime. Do not force replication; follow Microsoft guidance (usually demote and rebuild the DC).'; R = 'https://learn.microsoft.com/troubleshoot/windows-server/active-directory/replication-error-8614' }
@@ -477,7 +509,15 @@ function Start-Painfree {
 
     Invoke-Check 'Event logs (errors and known issues)' {
         foreach ($log in $logs) {
-            $events = @(Get-WinEvent -FilterHashtable @{ LogName = $log; Level = 1, 2, 3; StartTime = $PF.Start } -MaxEvents 20000 -ErrorAction SilentlyContinue)
+          # Each log is handled on its own so that a missing or unreadable log cannot stop the others
+          try {
+            if (-not (Get-WinEvent -ListLog $log -ErrorAction SilentlyContinue)) { continue }
+            try { $events = @(Get-WinEvent -FilterHashtable @{ LogName = $log; Level = 1, 2, 3; StartTime = $PF.Start } -MaxEvents 20000 -ErrorAction Stop) }
+            catch {
+                if ($_.Exception.Message -match 'No events were found') { continue }
+                # Some logs reject the combined filter; fall back to reading recent entries and filtering here
+                $events = @(Get-WinEvent -LogName $log -MaxEvents 20000 -ErrorAction Stop | Where-Object { $_.Level -in 1, 2, 3 -and $_.TimeCreated -ge $PF.Start })
+            }
             if (-not $events.Count) { continue }
             $groups = @{}
             $crashes = @{}
@@ -508,6 +548,7 @@ function Start-Painfree {
                     '{0:yyyy-MM-dd HH:mm}  {1}' -f $s.TimeCreated, $msg
                 }
                 $ev = @("Log: $log   Source: $($e.ProviderName)   Event ID: $($e.Id)   Occurrences: $($g.Count)   Last: $($g.Last.ToString('yyyy-MM-dd HH:mm'))") + $samples
+                $PF.Events["$($e.ProviderName)|$($e.Id)"] = $g.Count
                 if ($g.Known) {
                     $k = $g.Known
                     Add-Finding -Category 'Event logs' -Severity $k.S -Title "$($k.T) - $($g.Count)x" -Description "Seen $($g.Count) time(s) in the $log log in the last $Days days." `
@@ -532,6 +573,8 @@ function Start-Painfree {
                     -Evidence @("Program: $($c.App)", "Faulting module: $($c.Module)", "Last: $($c.Last.ToString('yyyy-MM-dd HH:mm'))") `
                     -Fix "Update the program to the latest version or repair/reinstall it. If the faulting module is a third-party DLL (shell extensions, AV, overlays), update or remove that software. If the module is ntdll.dll or KERNELBASE.dll the fault is in the program itself."
             }
+          }
+          catch { $PF.Errors.Add([pscustomobject]@{ Check = "Event log '$log'"; Error = ($_.Exception.Message -split "`r?`n")[0] }) }
         }
     }
 
@@ -549,6 +592,26 @@ function Start-Painfree {
     }
 
     #endregion
+
+    Invoke-Check 'Power protection (UPS)' {
+        $kp41 = 0; $ups = 0
+        foreach ($k in $PF.Events.Keys) {
+            if ($k -match 'Kernel-Power\|41$') { $kp41 += $PF.Events[$k] }
+            if ($k -match '(APCPBEAgent|PowerChute)\|3005$') { $ups += $PF.Events[$k] }
+        }
+        $upsSoftware = @($services | Where-Object { $_.Name -match 'APC|PowerChute|PBEAgent|Eaton|IPP|IPM|CyberPower|PowerPanel|upsmon|NUT' -or $_.DisplayName -match 'PowerChute|UPS|Intelligent Power' })
+        if ($kp41 -gt 0 -and $ups -gt 0) {
+            Add-Finding -Category 'Power' -Severity 'High' -Title "Server lost power $kp41 time(s) while the UPS was not communicating" `
+                -Description 'Unexpected restarts happened at the same time as the UPS software reported it could not reach the UPS. The server and its VMs or databases are not protected from power cuts.' `
+                -Evidence @("Kernel-Power 41 events: $kp41", "PowerChute 'Communication Not Established' events: $ups") `
+                -Fix "1. Find out what happened at those times (power cut, breaker, maintenance).`n2. Fix the UPS-to-server connection (vendor USB/serial cable, reinstall or reconfigure the agent) until the UPS software shows battery charge and runtime.`n3. Run a UPS self-test and check the battery age.`n4. Set a safe shutdown threshold, and on Hyper-V hosts set VM Automatic Stop Action to Shut Down or Save."
+        }
+        elseif ($kp41 -gt 0 -and $isServer -and -not $upsSoftware.Count) {
+            Add-Finding -Category 'Power' -Severity 'Medium' -Title "Server lost power $kp41 time(s) and no UPS shutdown software was found" `
+                -Description 'Unexpected restarts were logged and no UPS agent (APC PowerChute, Eaton IPP, CyberPower PowerPanel and similar) is installed, so the server cannot shut down cleanly on battery.' `
+                -Evidence "Kernel-Power 41 events: $kp41" -Fix 'Connect the server to a UPS and install its shutdown agent, or configure network shutdown from the UPS management card.'
+        }
+    }
 
     #region ---------- Hardware, disks and performance ----------
 
@@ -612,7 +675,18 @@ function Start-Painfree {
         $free = [double]$os.FreePhysicalMemory * 1KB
         $usedPct = [math]::Round((1 - $free / $total) * 100)
         $top = Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 8 | ForEach-Object { '{0,-30} {1,10}' -f $_.ProcessName, (Format-Size $_.WorkingSet64) }
-        if ($usedPct -ge 90) {
+        $vmMem = 0
+        if ($PF.Roles -contains 'Hyper-V') { $vmMem = [double](@(Get-VM -ErrorAction SilentlyContinue) | Measure-Object MemoryAssigned -Sum).Sum }
+        if ($vmMem -gt 0) {
+            # On a Hyper-V host most RAM is handed to VMs on purpose; judge only what is left for the host
+            $PF.Info['Memory'] = "$(Format-Size $total) ($(Format-Size $vmMem) assigned to running VMs)"
+            if ($free -lt 2GB) {
+                Add-Finding -Category 'Performance' -Severity 'Medium' -Title "Hyper-V host has only $(Format-Size $free) of free memory" -Description 'Running VMs use most of the RAM and the host itself is nearly out. New VMs or restarts may fail to start, and the host may page heavily.' `
+                    -Evidence (@("Total $(Format-Size $total), assigned to VMs $(Format-Size $vmMem), free $(Format-Size $free)", 'Top host processes by memory:') + $top) `
+                    -Fix 'Reduce the startup/maximum memory of some VMs, use dynamic memory, or add RAM. Keep at least 4 GB free for the host.' -Command "Get-VM | Select-Object Name, State, @{n='AssignedGB';e={[math]::Round(`$_.MemoryAssigned/1GB,1)}}, DynamicMemoryEnabled"
+            }
+        }
+        elseif ($usedPct -ge 90) {
             Add-Finding -Category 'Performance' -Severity 'Medium' -Title "Memory is $usedPct% used" -Description 'The system is close to running out of physical memory, which causes heavy paging and slowness.' `
                 -Evidence (@("$(Format-Size ($total - $free)) used of $(Format-Size $total)", 'Top processes by memory:') + $top) `
                 -Fix 'Close or fix the processes using the most memory, check for memory leaks (memory growing over days), or add RAM. On SQL/Exchange servers, high usage can be normal; set max server memory instead.'
@@ -695,7 +769,7 @@ function Start-Painfree {
 
     Invoke-Check 'Automatic services not running' {
         # Services that are set to Automatic but stop by design
-        $ignore = 'gupdate|gupdatem|edgeupdate|edgeupdatem|MicrosoftEdgeElevationService|GoogleUpdater|sppsvc|RemoteRegistry|MapsBroker|tiledatamodelsvc|CDPSvc|ShellHWDetection|WbioSrvc|TrustedInstaller|stisvc|BITS|wuauserv|UsoSvc|DoSvc|WaaSMedicSvc|clr_optimization|NetTcpPortSharing|sedsvc|AGMService|AGSService|OneSyncSvc|CDPUserSvc|WpnUserService|Intel\(R\) TPM|SysMain|Dnscache|IaasVmProvider|DPS|WinDefend|MsMpSvc|Sense|wscsvc|gpsvc|tzautoupdate|CertPropSvc|AdobeARMservice|ClickToRunSvc|VSStandardCollectorService|ssh-agent|osrss|SgrmBroker|WSearch|cbdhsvc|camsvc|InventorySvc|DcpSvc'
+        $ignore = 'gupdate|gupdatem|edgeupdate|edgeupdatem|MicrosoftEdgeElevationService|GoogleUpdater|sppsvc|RemoteRegistry|MapsBroker|tiledatamodelsvc|CDPSvc|ShellHWDetection|WbioSrvc|TrustedInstaller|stisvc|BITS|wuauserv|UsoSvc|DoSvc|WaaSMedicSvc|clr_optimization|NetTcpPortSharing|sedsvc|AGMService|AGSService|OneSyncSvc|CDPUserSvc|WpnUserService|Intel\(R\) TPM|SysMain|Dnscache|IaasVmProvider|DPS|WinDefend|MsMpSvc|Sense|wscsvc|gpsvc|tzautoupdate|CertPropSvc|AdobeARMservice|ClickToRunSvc|VSStandardCollectorService|ssh-agent|osrss|SgrmBroker|WSearch|cbdhsvc|camsvc|InventorySvc|DcpSvc|uvnc_service'
         $stopped = @($services | Where-Object {
                 $_.StartMode -eq 'Auto' -and $_.State -ne 'Running' -and $_.Name -notmatch "^($ignore)" -and -not $_.DelayedAutoStart -and
                 -not (Test-Path "HKLM:\SYSTEM\CurrentControlSet\Services\$($_.Name)\TriggerInfo")
@@ -742,7 +816,7 @@ function Start-Painfree {
     }
 
     Invoke-Check 'Scheduled tasks' {
-        $okCodes = 0, 267008, 267009, 267011, 267012, 267014, 267045, 1, 2147750687
+        $okCodes = 0, 1056, 267008, 267009, 267011, 267012, 267014, 267045, 1, 2147750687
         $tasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.State -ne 'Disabled' -and $_.TaskPath -notlike '\Microsoft\*' })
         $failed = @(); $broken = @()
         foreach ($t in $tasks) {
@@ -883,10 +957,14 @@ function Start-Painfree {
                     -Evidence ($thirdParty | ForEach-Object { $_.displayName }) -Fix 'Keep one antivirus and uninstall the others with their vendor removal tool.'
             }
         }
-        else {
-            $avSvc = 'SentinelAgent|CSFalconService|SAVService|Sophos|ekrn|McAfee|mfemms|Symantec|SepMasterService|bdservicehost|EPSecurityService|WRSVC|CylanceSvc|TmCCSF|ds_agent|CarbonBlack|cbdefense|HuntressAgent|AvastSvc|AVP|klnagent'
-            $thirdParty = @($services | Where-Object { $_.Name -match "^($avSvc)" -and $_.State -eq 'Running' })
+        if (-not $thirdParty.Count) {
+            # Servers have no Security Center, and some business AV does not register with it either
+            $avSvc = 'SentinelAgent|CSFalconService|SAVService|Sophos|ekrn|McAfee|mfemms|Symantec|SepMasterService|bdservicehost|EPSecurityService|WRSVC|CylanceSvc|TmCCSF|ds_agent|CarbonBlack|cbdefense|AvastSvc|AVP|klnagent'
+            $avName = 'Datto AV|Trend Micro|Webroot|Bitdefender|ESET|Sophos|SentinelOne|CrowdStrike|Malwarebytes|Cylance|Carbon Black|Symantec|McAfee|Trellix|Kaspersky|WithSecure|F-Secure|Avast|AVG|VIPRE|Emsisoft|Cisco Secure Endpoint|Panda|Cortex XDR|Elastic Agent'
+            $thirdParty = @($services | Where-Object { $_.State -eq 'Running' -and ($_.Name -match "^($avSvc)" -or $_.DisplayName -match "($avName)") } |
+                    ForEach-Object { [pscustomobject]@{ displayName = $_.DisplayName } })
         }
+        $edrOnly = @($services | Where-Object { $_.State -eq 'Running' -and $_.DisplayName -match 'Datto EDR|Infocyte|HUNT Agent|Huntress|Blackpoint|SnapAgent' } | ForEach-Object DisplayName)
         $mp = if (Get-Command Get-MpComputerStatus -ErrorAction SilentlyContinue) { Get-MpComputerStatus -ErrorAction SilentlyContinue } else { $null }
         if ($mp) {
             $passive = "$($mp.AMRunningMode)" -match 'Passive|EDR'
@@ -908,6 +986,11 @@ function Start-Painfree {
             $PF.Info['Antivirus'] = if ($thirdParty.Count) { ($thirdParty | ForEach-Object { if ($_.displayName) { $_.displayName } else { $_.DisplayName } }) -join ', ' } else { "Microsoft Defender ($($mp.AMRunningMode))" }
         }
         elseif ($thirdParty.Count) { $PF.Info['Antivirus'] = ($thirdParty | ForEach-Object { if ($_.displayName) { $_.displayName } else { $_.DisplayName } }) -join ', ' }
+        elseif ($edrOnly.Count) {
+            Add-Finding -Category 'Security' -Severity 'High' -Title "Only EDR found ($($edrOnly -join ', ')), no antivirus" -Description 'An EDR agent is running, but no antivirus was found: Microsoft Defender is missing or removed and no other AV service is running. Most EDR products expect an AV underneath them.' `
+                -Evidence (@($edrOnly) + 'Microsoft Defender: not present') -Fix 'Confirm in your RMM/EDR console whether an AV (for example Datto AV or Defender) should be on this machine. If not, reinstall Defender.' `
+                -Command $(if ($isServer) { 'Install-WindowsFeature Windows-Defender   # reboot required' } else { 'Get-Service WinDefend' })
+        }
         else {
             Add-Finding -Category 'Security' -Severity 'High' -Title 'No antivirus detected' -Description 'Neither Microsoft Defender nor a known third-party antivirus was found running.' `
                 -Fix 'Install Microsoft Defender (Server: Install-WindowsFeature Windows-Defender) or your organisation''s antivirus.'
@@ -1090,6 +1173,15 @@ function Start-Painfree {
                     -Command $(if ($isDC) { 'w32tm /config /manualpeerlist:"time.windows.com,0x8 pool.ntp.org,0x8" /syncfromflags:manual /reliable:yes /update; w32tm /resync' } elseif ($cs.PartOfDomain) { 'w32tm /config /syncfromflags:domhier /update; w32tm /resync' } else { 'w32tm /config /manualpeerlist:"time.windows.com,0x8" /syncfromflags:manual /update; w32tm /resync' })
             }
         }
+        $timeTools = @(foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*') {
+                Get-ItemProperty $k -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match '^(NetTime|Meinberg|NTP for Windows|Dimension 4|Atomic Clock Sync|AtomTime|TimeSync|Tardis|SP TimeSync)' } | ForEach-Object { $_.DisplayName }
+            })
+        if ($timeTools.Count) {
+            Add-Finding -Category 'Network' -Severity $(if ("$($PF.Info['Time source'])" -match 'Local CMOS|Free-running') { 'Medium' } else { 'Low' }) -Title "Third-party time software installed: $($timeTools -join ', ')" `
+                -Description 'Running a separate time tool alongside Windows Time makes two programs fight over the clock and hides Windows Time misconfiguration. Windows Time is sufficient on all supported versions.' `
+                -Evidence (@($timeTools) + "Windows Time source: $($PF.Info['Time source'])") -Fix 'Uninstall the third-party tool and configure Windows Time instead (domain members: domain hierarchy; standalone and PDC: an NTP pool).' `
+                -Command 'w32tm /config /manualpeerlist:"0.pool.ntp.org,0x8 1.pool.ntp.org,0x8 time.windows.com,0x8" /syncfromflags:manual /update; Restart-Service w32time; w32tm /resync /force'
+        }
         $winhttp = (& netsh winhttp show proxy 2>$null) -join ' '
         if ($winhttp -match 'Proxy Server\(s\)\s*:\s*(\S+)') {
             Add-Finding -Category 'Network' -Severity 'Info' -Title "System (WinHTTP) proxy is set: $($Matches[1])" -Description 'Windows services use this proxy. A stale proxy breaks Windows Update, activation and Defender updates.' `
@@ -1266,22 +1358,44 @@ function Start-Painfree {
             $dirs = @($env:ProgramData, ${env:ProgramFiles}, ${env:ProgramFiles(x86)}) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
             $files = foreach ($d in $dirs) {
                 Get-ChildItem -Path $d -Include *.log, *.txt -Recurse -Depth 4 -File -ErrorAction SilentlyContinue |
-                    Where-Object { $_.LastWriteTime -gt $PF.Start -and $_.Length -gt 0 -and $_.FullName -notmatch '\\Microsoft\\(Windows|Search|Diagnosis|Network)\\|\\WER\\|\\Package Cache\\|\\Windows Defender\\|\\inetpub\\|readme|license|third.?party|notice' }
+                    Where-Object { $_.LastWriteTime -gt $PF.Start -and $_.Length -gt 0 -and $_.FullName -notmatch '\\Microsoft\\(Windows|Search|Diagnosis|Network|EdgeUpdate|Edge)\\|\\WER\\|\\Package Cache\\|\\Windows Defender\\|\\inetpub\\|readme|license|third.?party|notice' }
             }
             $files = @($files | Sort-Object LastWriteTime -Descending | Select-Object -First 300)
-            $results = foreach ($f in $files) {
+            $errRx = '(?i)(\[(ERR|ERROR|FTL|FATAL|CRIT)\]|\|(ERROR|FATAL)\||\b(ERROR|FATAL|CRITICAL)\b\s*[:\-\]|]|\bunhandled exception\b|Exception:\s)'
+            $skipRx = '(?i)\b(WARN|WARNING|INFO|DEBUG|TRACE|VERBOSE)\b\s*[:\-\]|]|analytics|telemetry|countly|\b0 errors?\b|no errors?|errors?\s*[:=]\s*0\b'
+            $netRx = '(?i)no such host|error sending request|failed to send request|NameResolutionFailure|could not be resolved|os error 11001|WSAHOST_NOT_FOUND|actively refused|connection (timed out|was closed)|unable to connect to the remote server|network is unreachable|0x80072ee[27]'
+            $byApp = @{}; $netApps = @{}
+            foreach ($f in $files) {
+                $app = ($f.FullName -replace '^(?i)[a-z]:\\(ProgramData|Program Files( \(x86\))?)\\', '' -split '\\')[0]
                 $lines = Read-FileTail $f.FullName 262144
-                $hits = @($lines | Where-Object { $_ -match '(?i)\b(error|fatal|exception|critical|failed|failure)\b' -and $_ -notmatch '(?i)\b0 errors?\b|no errors?|errors?\s*[:=]\s*0\b|without error|error.?level\s*[:=]\s*(info|debug)' })
-                if ($hits.Count -ge 20) { [pscustomobject]@{ File = $f.FullName; Count = $hits.Count; Sample = @($hits | Select-Object -Last 5) ; Modified = $f.LastWriteTime } }
+                $net = @($lines | Where-Object { $_ -match $netRx })
+                if ($net.Count) {
+                    if (-not $netApps.ContainsKey($app)) { $netApps[$app] = @{ Count = 0; Sample = '' } }
+                    $netApps[$app].Count += $net.Count
+                    if (-not $netApps[$app].Sample) { $netApps[$app].Sample = "$($net[-1])".Trim() }
+                }
+                $hits = @($lines | Where-Object { $_ -match $errRx -and $_ -notmatch $skipRx -and $_ -notmatch $netRx })
+                if (-not $hits.Count) { continue }
+                if (-not $byApp.ContainsKey($app)) { $byApp[$app] = @{ Count = 0; Files = New-Object System.Collections.Generic.List[string]; Sample = $null; Newest = $f } }
+                $a = $byApp[$app]
+                $a.Count += $hits.Count; $a.Files.Add($f.FullName)
+                if (-not $a.Sample) { $a.Sample = @($hits | Select-Object -Last 5); $a.Newest = $f }
             }
-            foreach ($r in @($results | Sort-Object Count -Descending | Select-Object -First 10)) {
-                $app = ($r.File -replace '^(?i)[a-z]:\\(ProgramData|Program Files( \(x86\))?)\\', '' -split '\\')[0]
-                $sample = $r.Sample | ForEach-Object { $s = "$_".Trim(); if ($s.Length -gt 300) { $s.Substring(0, 300) + '...' } else { $s } }
-                Add-Finding -Category 'Program logs' -Severity $(if ($r.Count -ge 500) { 'Medium' } else { 'Low' }) -Title "$app log shows $($r.Count) error lines" `
-                    -Description "The most recent part of this application log file contains many error/exception lines." `
-                    -Evidence (@("File: $($r.File)", "Last written: $($r.Modified.ToString('yyyy-MM-dd HH:mm'))", 'Most recent error lines:') + $sample) `
+            if ($netApps.Count -ge 2) {
+                Add-Finding -Category 'Network' -Severity 'High' -Title "$($netApps.Count) applications report DNS or connection failures in their logs" `
+                    -Description 'Several programs independently failed to resolve names or reach their servers in the last few days. That points to an intermittent network, DNS, proxy or firewall problem on this machine rather than a problem in each program.' `
+                    -Evidence ($netApps.Keys | ForEach-Object { $s = $netApps[$_].Sample; if ($s.Length -gt 220) { $s = $s.Substring(0, 220) + '...' }; "$_ ($($netApps[$_].Count) lines): $s" }) `
+                    -Fix "1. Check the DNS servers and that they respond reliably (run the test loop below for an hour).`n2. Look for NIC or virtual switch errors (driver/firmware updates, VMQ on Hyper-V hosts), flapping links and duplicate IPs.`n3. Check firewall/proxy rules for the agents' hosts and ports.`n4. If failures only appear right after boot, the network is starting late; that is usually harmless." `
+                    -Command "while (`$true) { '{0:HH:mm:ss} {1}' -f (Get-Date), [bool](Resolve-DnsName www.microsoft.com -DnsOnly -QuickTimeout -ErrorAction SilentlyContinue); Start-Sleep 10 }"
+            }
+            foreach ($app in @($byApp.Keys | Where-Object { $byApp[$_].Count -ge 20 } | Sort-Object { $byApp[$_].Count } -Descending | Select-Object -First 10)) {
+                $a = $byApp[$app]
+                $sample = $a.Sample | ForEach-Object { $s = "$_".Trim(); if ($s.Length -gt 300) { $s.Substring(0, 300) + '...' } else { $s } }
+                Add-Finding -Category 'Program logs' -Severity $(if ($a.Count -ge 500) { 'Medium' } else { 'Low' }) -Title "$app logs show $($a.Count) error lines" `
+                    -Description "Error-level lines in $($a.Files.Count) recent log file(s) of this application (warnings and connection failures are counted separately)." `
+                    -Evidence (@("Newest file: $($a.Newest.FullName)", "Last written: $($a.Newest.LastWriteTime.ToString('yyyy-MM-dd HH:mm'))", 'Most recent error lines:') + $sample) `
                     -Fix "Open the log and look at the recurring error. Common causes: expired licence, wrong service account password, unreachable server or database, full disk, or a version that needs updating. Check the vendor's support site for the error text." `
-                    -Command "notepad `"$($r.File)`""
+                    -Command "notepad `"$($a.Newest.FullName)`""
             }
         }
     }
@@ -1518,6 +1632,18 @@ FROM sys.databases d WHERE d.name <> 'tempdb' AND d.source_database_id IS NULL
             if ($rep.Count) {
                 Add-Finding -Category 'Hyper-V' -Severity 'High' -Title "$($rep.Count) VM replica(s) unhealthy" -Description 'Hyper-V Replica is not keeping the replica copies up to date.' `
                     -Evidence ($rep | ForEach-Object { "$($_.VMName): $($_.Health) $($_.State)" }) -Fix 'Check the replication state in Hyper-V Manager; resume or resynchronise replication.' -Command 'Resume-VMReplication -VMName "<vm>"'
+            }
+            foreach ($sw in @(Get-VMSwitch -SwitchType External -ErrorAction SilentlyContinue)) {
+                $nic = Get-NetAdapter -InterfaceDescription $sw.NetAdapterInterfaceDescription -ErrorAction SilentlyContinue
+                if (-not $nic -or "$($nic.LinkSpeed)" -notmatch '^1 Gbps$') { continue }
+                $vmq = Get-NetAdapterVmq -Name $nic.Name -ErrorAction SilentlyContinue
+                $errs = 0; foreach ($k in $PF.Events.Keys) { if ($k -match 'VmSwitch\|260$') { $errs += $PF.Events[$k] } }
+                if ($vmq -and $vmq.Enabled) {
+                    Add-Finding -Category 'Hyper-V' -Severity $(if ($errs) { 'Medium' } else { 'Low' }) -Title "VMQ is enabled on 1 GbE adapter '$($nic.Name)' behind switch '$($sw.Name)'" `
+                        -Description 'VMQ gives little benefit at 1 Gbps and is a long-standing cause of slow or dropped VM network traffic with some drivers. Microsoft and NIC vendors recommend turning it off on 1 GbE adapters.' `
+                        -Evidence @("$($nic.Name): $($nic.InterfaceDescription), $($nic.LinkSpeed), driver $($nic.DriverVersion)", "VmSwitch 260 errors in the scan window: $errs") `
+                        -Fix 'Update the NIC driver/firmware first. Then, in a maintenance window (VM traffic blips briefly), disable VMQ on this physical adapter.' -Command "Disable-NetAdapterVmq -Name '$($nic.Name)'"
+                }
             }
             $turnoff = @($vms | Where-Object { "$($_.AutomaticStopAction)" -eq 'TurnOff' })
             if ($turnoff.Count) {
